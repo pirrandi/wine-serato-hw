@@ -16,4 +16,35 @@ if [[ -f "$conf" ]]; then
 fi
 
 cd "$WINEPREFIX/drive_c/Program Files/Serato/Serato DJ Pro" || exit 1
-exec wine "Serato DJ Pro.exe" "$@"
+
+# Serato crashes while quitting under Wine; with wineasio loaded its crash reporter
+# then waits forever and the process never exits. By then MIDI and audio are already
+# released, so once Serato logs its shutdown phase, give it a grace period and stop
+# the prefix if it is still alive. Only the log created by this launch is watched.
+logs_dir=$(xdg-user-dir MUSIC 2>/dev/null || echo "$HOME/Music")/_Serato_/Logs
+grace=${SERATO_QUIT_GRACE:-20}
+marker=$(mktemp)
+trap 'rm -f "$marker"' EXIT
+
+wine "Serato DJ Pro.exe" "$@" &
+pid=$!
+log=
+while kill -0 "$pid" 2>/dev/null; do
+    sleep 2
+    if [[ -z "$log" ]]; then
+        for f in "$logs_dir"/*.log; do
+            [[ "$f" -nt "$marker" ]] && { log=$f; break; }
+        done
+    elif grep -q 'Application phase set to Shutdown' "$log"; then
+        for _ in $(seq "$grace"); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "serato-launch: Serato still running ${grace}s after quitting, stopping the prefix" >&2
+            wineserver -k
+        fi
+        break
+    fi
+done
+wait "$pid"

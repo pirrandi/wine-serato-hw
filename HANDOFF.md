@@ -167,6 +167,14 @@ Captured with `tools/windows-capture/` on Windows 10 (raw output not published).
 25. Killing Serato (`wineserver -k`) while it holds the MIDI port can hang the controller: LEDs off,
     no MIDI events, no SysEx reply, but still enumerated over USB (Serato then logs CONNECTED but no
     `Hercules Connection`). Fix: unplug/replug the USB cable.
+26. **Serato hangs on quit (worked around).** Serato hits an uncaught C++ exception while quitting under
+    Wine in every configuration, even without any of this project's layers (`Dumps/last_crash` matches
+    the quit time). It only hangs afterwards when wineasio is loaded (stock or patched, with or without
+    `mlockall`): the crash reporter waits forever on crashpad, which writes no dump. winedbg shows no
+    thread in wineasio; crashpad_handler cannot be attached (error 87). MIDI and JACK are already
+    released at that point, so `serato-launch.sh` watches the log created by its own launch and runs
+    `wineserver -k` if Serato is still alive 20 s (`SERATO_QUIT_GRACE`) after
+    "Application phase set to Shutdown" (only logged on quit). Root cause still unknown.
 
 ## Next step
 
