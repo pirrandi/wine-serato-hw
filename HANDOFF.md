@@ -82,7 +82,7 @@ For device-tree tracing add `WINEDEBUG=+setupapi,+reg` (huge output; Serato's ma
 
 ## Windows capture results (2026-10-14)
 
-Capture in `/mnt/ssd/wine-serato-hw-capture/output/`. Key facts:
+Captured with `tools/windows-capture/` on Windows 10 (raw output not published). Key facts:
 
 - On Windows the Hercules vendor driver owns the device:
   `USB\VID_06F8&PID_B12B\<id>` (usbccgp) -> `USB\...&MI_00` (HDJusbaudio) ->

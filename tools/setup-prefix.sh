@@ -52,4 +52,19 @@ wine reg add "HKLM\\Software\\ASIO\\$ASIO_NAME" /v CLSID /d "$WINEASIO_CLSID" /f
 wine reg add "HKLM\\Software\\ASIO\\$ASIO_NAME" /v Description /d "$ASIO_NAME" /f /reg:64 >/dev/null
 echo "ASIO: patched wineasio registered as '$ASIO_NAME'"
 
+# Serato's account login returns through a seratodjpro:// URL; without a session the
+# controller's MIDI connection never starts.
+apps=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+mkdir -p "$apps"
+cat > "$apps/serato-djpro-url.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Serato DJ Pro (URL handler)
+Exec=$REPO/tools/serato-launch.sh %u
+MimeType=x-scheme-handler/seratodjpro;
+NoDisplay=true
+Terminal=false
+EOF
+xdg-mime default serato-djpro-url.desktop x-scheme-handler/seratodjpro
+
 echo "Prefix ready: $WINEPREFIX"
