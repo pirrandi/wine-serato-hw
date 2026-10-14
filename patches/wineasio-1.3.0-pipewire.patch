@@ -1,0 +1,206 @@
+wineasio 1.3.0: PipeWire-safe host notifications and port filters.
+
+1. With pipewire-jack, the JACK buffer-size, latency and sample-rate callbacks
+   run on PipeWire threads that Wine does not know. wineasio called the ASIO
+   host (sendNotification / sampleRateChanged) directly from them, so any graph
+   change (a link, another application starting to play) crashed the host with
+   "Exception c0000005 in system thread" (see wineasio issue #132). The
+   callbacks now only set flags; a Wine thread created in Init delivers them.
+2. PipeWire recomputes latencies on every graph change. Hosts such as Serato
+   restart the driver on kAsioLatenciesChanged, which drops audio and redoes
+   the hardware connections. Latency changes are now reported only when the
+   capture/playback latency of the ports actually changed.
+3. "Connect to hardware" connects to every physical port in PipeWire's order.
+   WINEASIO_INPUT_PORTS / WINEASIO_OUTPUT_PORTS (regular expressions on the
+   JACK port name) restrict it, e.g. to the controller's own outputs.
+
+--- a/asio.c	2026-10-14 17:53:36.091904761 -0300
++++ b/asio.c	2026-10-14 17:58:35.216584321 -0300
+@@ -226,8 +226,18 @@
+     jack_default_audio_sample_t *callback_audio_buffer;
+     IOChannel                   *input_channel;
+     IOChannel                   *output_channel;
++
++    /* host notifications raised by JACK on non-Wine threads, delivered by notify_thread */
++    volatile LONG               pending_notifications;
++    volatile LONG               pending_sample_rate;
++    volatile LONG               notify_thread_stop;
++    HANDLE                      notify_thread;
++    jack_nframes_t              reported_input_latency;
++    jack_nframes_t              reported_output_latency;
+ } IWineASIOImpl;
+ 
++enum { NotifyBufferSize = 1, NotifyLatency = 2, NotifySampleRate = 4 };
++
+ enum { Loaded, Initialized, Prepared, Running };
+ 
+ /****************************************************************************
+@@ -297,6 +307,9 @@
+ static inline void jack_latency_callback(jack_latency_callback_mode_t mode, void *arg);
+ static inline int  jack_process_callback (jack_nframes_t nframes, void *arg);
+ static inline int  jack_sample_rate_callback (jack_nframes_t nframes, void *arg);
++static DWORD WINAPI notify_thread_proc(LPVOID arg);
++static BOOL         update_reported_latencies(IWineASIOImpl *This);
++static void         stop_notify_thread(IWineASIOImpl *This);
+ 
+ /*
+  *  Support functions
+@@ -425,6 +438,8 @@
+         This->host_active_inputs = This->host_active_outputs = 0;
+         TRACE("%i IOChannel structures released\n", This->wineasio_number_inputs + This->wineasio_number_outputs);
+ 
++        stop_notify_thread(This);
++
+         jackbridge_free (This->jack_output_ports);
+         jackbridge_free (This->jack_input_ports);
+         jackbridge_client_close(This->jack_client);
+@@ -478,11 +493,22 @@
+     This->output_channel = This->input_channel + This->wineasio_number_inputs;
+     TRACE("%i IOChannel structures allocated\n", This->wineasio_number_inputs + This->wineasio_number_outputs);
+ 
+-    /* Get and count physical JACK ports */
+-    This->jack_input_ports = jackbridge_get_ports(This->jack_client, NULL, NULL, JackPortIsPhysical | JackPortIsOutput);
++    /* Get and count physical JACK ports, optionally restricted by WINEASIO_INPUT_PORTS /
++     * WINEASIO_OUTPUT_PORTS (regular expressions on the JACK port name) */
++    {
++        char input_pattern[256] = "", output_pattern[256] = "";
++
++        if (GetEnvironmentVariableA("WINEASIO_INPUT_PORTS", input_pattern, sizeof(input_pattern)) >= sizeof(input_pattern))
++            input_pattern[0] = 0;
++        if (GetEnvironmentVariableA("WINEASIO_OUTPUT_PORTS", output_pattern, sizeof(output_pattern)) >= sizeof(output_pattern))
++            output_pattern[0] = 0;
++        This->jack_input_ports = jackbridge_get_ports(This->jack_client, input_pattern[0] ? input_pattern : NULL,
++                                                      JACK_DEFAULT_AUDIO_TYPE, JackPortIsPhysical | JackPortIsOutput);
++        This->jack_output_ports = jackbridge_get_ports(This->jack_client, output_pattern[0] ? output_pattern : NULL,
++                                                       JACK_DEFAULT_AUDIO_TYPE, JackPortIsPhysical | JackPortIsInput);
++    }
+     for (This->jack_num_input_ports = 0; This->jack_input_ports && This->jack_input_ports[This->jack_num_input_ports]; This->jack_num_input_ports++)
+         ;
+-    This->jack_output_ports = jackbridge_get_ports(This->jack_client, NULL, NULL, JackPortIsPhysical | JackPortIsInput);
+     for (This->jack_num_output_ports = 0; This->jack_output_ports && This->jack_output_ports[This->jack_num_output_ports]; This->jack_num_output_ports++)
+         ;
+ 
+@@ -541,6 +567,12 @@
+         return 0;
+     }
+ 
++    This->pending_notifications = 0;
++    This->notify_thread_stop = 0;
++    This->notify_thread = CreateThread(NULL, 0, notify_thread_proc, This, 0, NULL);
++    if (!This->notify_thread)
++        WARN("Unable to create host notification thread\n");
++
+     This->host_driver_state = Initialized;
+     TRACE("WineASIO 0.%.1f initialized\n",(float) This->host_version / 10);
+     return 1;
+@@ -642,6 +674,7 @@
+     /* switch host buffer */
+     This->host_buffer_index = This->host_buffer_index ? 0 : 1;
+ 
++    update_reported_latencies(This);
+     This->host_driver_state = Running;
+     TRACE("WineASIO successfully loaded\n");
+     return 0;
+@@ -1246,11 +1279,11 @@
+ {
+     IWineASIOImpl   *This = (IWineASIOImpl*)arg;
+ 
++    /* Runs on a JACK/PipeWire thread that Wine does not know: never call into the host here. */
+     if(This->host_driver_state != Running)
+         return 0;
+ 
+-    if (This->host_callbacks->sendNotification(1, 3, 0, 0))
+-        This->host_callbacks->sendNotification(3, 0, 0, 0);
++    InterlockedOr(&This->pending_notifications, NotifyBufferSize);
+     return 0;
+ }
+ 
+@@ -1258,13 +1291,11 @@
+ {
+     IWineASIOImpl   *This = (IWineASIOImpl*)arg;
+ 
++    /* Runs on a JACK/PipeWire thread that Wine does not know: never call into the host here. */
+     if(This->host_driver_state != Running)
+         return;
+ 
+-    if (This->host_callbacks->sendNotification(1, 6, 0, 0))
+-        This->host_callbacks->sendNotification(6, 0, 0, 0);
+-
+-    return;
++    InterlockedOr(&This->pending_notifications, NotifyLatency);
+ }
+ 
+ static inline int jack_process_callback(jack_nframes_t nframes, void *arg)
+@@ -1339,14 +1370,70 @@
+ {
+     IWineASIOImpl   *This = (IWineASIOImpl*)arg;
+ 
++    /* Runs on a JACK/PipeWire thread that Wine does not know: never call into the host here. */
+     if(This->host_driver_state != Running)
+         return 0;
+ 
+-    This->host_sample_rate = nframes;
+-    This->host_callbacks->sampleRateChanged(nframes);
++    InterlockedExchange(&This->pending_sample_rate, (LONG) nframes);
++    InterlockedOr(&This->pending_notifications, NotifySampleRate);
++    return 0;
++}
++
++/* Delivers the notifications queued by the JACK callbacks from a Wine thread. */
++static DWORD WINAPI notify_thread_proc(LPVOID arg)
++{
++    IWineASIOImpl   *This = (IWineASIOImpl*)arg;
++    LONG            pending;
++
++    while (!This->notify_thread_stop)
++    {
++        Sleep(10);
++        pending = InterlockedExchange(&This->pending_notifications, 0);
++        if (!pending || This->host_driver_state != Running || !This->host_callbacks)
++            continue;
++
++        if (pending & NotifySampleRate)
++        {
++            This->host_sample_rate = InterlockedCompareExchange(&This->pending_sample_rate, 0, 0);
++            This->host_callbacks->sampleRateChanged(This->host_sample_rate);
++        }
++        if ((pending & NotifyBufferSize) && This->host_callbacks->sendNotification(1, 3, 0, 0))
++            This->host_callbacks->sendNotification(3, 0, 0, 0);
++        /* PipeWire recomputes latencies on every graph change (any link, any other client);
++         * hosts such as Serato restart the driver on kAsioLatenciesChanged, so only report real changes. */
++        if ((pending & NotifyLatency) && update_reported_latencies(This)
++                && This->host_callbacks->sendNotification(1, 6, 0, 0))
++            This->host_callbacks->sendNotification(6, 0, 0, 0);
++    }
+     return 0;
+ }
+ 
++/* Returns TRUE when the latencies differ from the ones last reported to the host. */
++static BOOL update_reported_latencies(IWineASIOImpl *This)
++{
++    jack_latency_range_t    in_range, out_range;
++    BOOL                    changed;
++
++    jackbridge_port_get_latency_range(This->input_channel[0].port, JackCaptureLatency, &in_range);
++    jackbridge_port_get_latency_range(This->output_channel[0].port, JackPlaybackLatency, &out_range);
++    changed = in_range.max != This->reported_input_latency || out_range.max != This->reported_output_latency;
++    This->reported_input_latency = in_range.max;
++    This->reported_output_latency = out_range.max;
++    return changed;
++}
++
++static void stop_notify_thread(IWineASIOImpl *This)
++{
++    if (!This->notify_thread)
++        return;
++    InterlockedExchange(&This->notify_thread_stop, 1);
++    /* The host may release the driver from inside one of its own notification handlers. */
++    if (GetCurrentThreadId() != GetThreadId(This->notify_thread))
++        WaitForSingleObject(This->notify_thread, INFINITE);
++    CloseHandle(This->notify_thread);
++    This->notify_thread = NULL;
++}
++
+ /*****************************************************************************
+  *  Support functions
+  */
