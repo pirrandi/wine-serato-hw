@@ -117,30 +117,64 @@ Capture in `/mnt/ssd/wine-serato-hw-capture/output/`. Key facts:
 13. WMI queries (Win32_BIOS / Win32_DiskDrive serials) seen in loops are Serato's
     licensing fingerprint: unrelated, do not touch.
 
+## Findings, part 3 (Windows capture 2, 2026-10-14)
+
+14. **Driver key**: `HKLM\SOFTWARE\WOW6432Node\Guillemot Corporation\DJHERCULESMIX Series Drivers`
+    holds one empty subkey `2.HDJS.2023` (no values). Serato reads only that (Procmon).
+    `2023.2.0.0` in its log is derived from the name. Serato 4.0.3 (Wine) logs
+    "Driver is valid, update available" for 2.HDJS.2023 (Windows ran 4.0.2: "up to date").
+    Non-blocking. Created by `tools/setup-prefix.sh` via a .reg import (`reg add` adds `@=""`).
+15. **Hercules native handshake is plain MIDI SysEx** (manufacturer `00 01 4E`):
+    host sends `F0 00 01 4E 1C 02 04 7F 00.. F7` and `F0 00 01 4E 1C 01 7D 7F 00.. F7`; device
+    answers `..1C 05..` and `..1C 03 7D 7F 00 00 <7-bit pairs: fw 01 42, serial, manuf F0> F7`.
+    No vendor control requests in the USB capture. Verified identical via `amidi` on Linux.
+16. **Login was the MIDI blocker**: without a Serato account session the MIDI thread stops after
+    `[Midi] New MIDI connection`. After login: RtMidi opens, `Hercules Connection: Firmware 1.66`.
+    Login callback is `seratodjpro://`; handled by `~/.local/share/applications/serato-djpro-url.desktop`
+    -> `tools/serato-launch.sh %u`.
+17. **ASIO**: Windows uses `DJControl Inpulse 500 ASIO`, CLSID `{993E67E0-7470-45DC-928C-85F51337A000}`
+    (`hdjusbaudioasio_x64.dll`). Serato matches by key name, so the setup registers wineasio
+    (AUR 1.3.0) under that name. Wine 11 quirks: `wineasio-register` needs `wine64` (gone); the PE's
+    builtin name is `wineasio.dll` but COM registers `wineasio64.dll` -> both copied to system32,
+    builtin provided through `WINEDLLPATH=~/.local/lib/wine-serato-hw/dlls` (set by serato-launch.sh).
+18. **wineasio init crashed** (fixed by joining group `realtime`) (`tools/probes/asio_probe.c` reproduces it):
+    wineasio calls `mlockall()`; with memlock 8 MB, PipeWire's data-loop thread stack mmap fails
+    (EAGAIN), `pw_data_loop_start: can't create thread`, then NULL deref in `jack_client_open`.
+    Fix: user in group `realtime` (realtime-privileges: memlock unlimited) and re-login.
+19. Discarded: Hercules-style MIDI interface path (`hdjusbaudio_enum#...&ks#...`) changes nothing
+    (experiment removed from proxy.c).
+
+## Findings, part 4 (2026-10-14): it works
+
+20. **End to end OK**: `***CONNECTED***` -> `kConnectedMode` -> `Hercules Connection: Firmware 1.66`
+    -> ASIO `DJControl Inpulse 500 ASIO` running at 48 kHz. Serato asks for 960 frames, wineasio
+    (fixed buffersize) refuses, PortAudio corrects to the JACK quantum (1024). Audio confirmed audible.
+    The "driver update available" notice is cosmetic (see 14).
+21. **wineasio + pipewire-jack crash**: the JACK latency / buffer-size / sample-rate callbacks run
+    on PipeWire threads unknown to Wine; wineasio called the ASIO host from them, so any graph
+    change (a link, another app playing) killed Serato (`Exception c0000005 in system thread`,
+    upstream issue #132, unfixed in master). Serato also restarts the driver on every
+    `kAsioLatenciesChanged`, which PipeWire triggers on any graph change.
+22. **Fixed by `patches/wineasio-1.3.0-pipewire.patch`** (built by `tools/build-wineasio.sh`,
+    installed as builtin `wineasio.dll` in `~/.local/lib/wine-serato-hw/dlls`): callbacks only set
+    flags, a Wine thread delivers them; latency changes reported only when the port latency really
+    changes; `WINEASIO_OUTPUT_PORTS` / `WINEASIO_INPUT_PORTS` regexes restrict "Connect to hardware".
+23. **Routing**: pipewire-jack names physical ports `<node description>:<port>` (not the alias).
+    `serato-launch.sh` sets the regexes to the Inpulse ports: out_1-2 -> playback_FL/FR (master),
+    out_3-4 -> playback_RL/RR (headphones), capture_FL/FR -> in_1-2. Verified: live relinks no
+    longer crash or restart audio.
+24. Serato logs are in `~/Music/_Serato_/Logs`.
+25. Killing Serato (`wineserver -k`) while it holds the MIDI port can hang the controller: LEDs off,
+    no MIDI events, no SysEx reply, but still enumerated over USB (Serato then logs CONNECTED but no
+    `Hercules Connection`). Fix: unplug/replug the USB cable.
+
 ## Next step
 
-The user is running the second Windows capture (`tools/windows-capture/capture2.bat`
-+ `capture2.ps1`, copies in `/mnt/ssd/wine-serato-hw-capture/`). Expected in
-`/mnt/ssd/wine-serato-hw-capture/output2/`:
-
-- `guillemot*.reg`, `hercules*.reg`: the `DJHERCULESMIX Series Drivers` key (blocker #12).
-- `asio*.reg`, `asio_clsids.txt`: Hercules ASIO name, CLSID, DLL path.
-- `drivers_services.txt`, `uninstall.txt`, `files.txt`: Hercules drivers, services, tray apps.
-- `serato_hkcu.reg`, `serato_logs/`: Serato settings and logs of the captured session.
-- `procmon.csv`: Process Monitor log of Serato (filter: Serato DJ Pro.exe) during a full
-  connect + play session. Look for the Guillemot key reads, Hercules files/DLLs, and
-  DeviceIoControl on `hdjusbaudio_enum` paths.
-- `inpulse.pcapng`: USBPcap capture of the same session. Shows whether the
-  "Hercules Connection: Firmware/Serial/Driver Version" handshake is MIDI SysEx
-  (works through ALSA) or vendor control requests via the driver (needs emulation).
-
-Plan after analysis:
-1. Recreate the `DJHERCULESMIX Series Drivers` key with a setup tool (not by hand).
-2. Get past the Hercules native connection (MIDI thread currently exits after
-   `[Midi] New MIDI connection`).
-3. Audio: Serato wants an ASIO driver named `DJControl Inpulse 500 ASIO`; likely
-   register wineasio under that name.
-4. Package everything (setup script, README) for GitHub.
+1. Confirm by ear that the headphone cue (out_3-4) reaches the Inpulse headphone jack and master
+   the main outputs.
+2. Package for GitHub: README (requirements: realtime group, pipewire-jack, wine 11, mingw), license,
+   install flow (`tools/setup-prefix.sh`, `.desktop` + `seratodjpro://` handler).
+3. Optional: offer the wineasio patch upstream (issue #132).
 
 ## Repository layout
 
