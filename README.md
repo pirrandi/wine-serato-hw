@@ -74,6 +74,9 @@ a PR with its profile is welcome.
 - Serato says a driver update is available. Harmless.
 - Serato crashes when quitting under Wine and, with ASIO active, hangs afterwards.
   The launcher stops it 20 s after it starts shutting down (`SERATO_QUIT_GRACE`).
+- Serato sometimes crashes while starting, with the same hang. The launcher stops
+  it as soon as the crash is recorded and, within the first 90 s
+  (`SERATO_START_WINDOW`), starts it again once.
 - If Serato is killed while it holds the MIDI port, the controller can hang (LEDs
   off, no MIDI). Replug the USB cable.
 

@@ -175,6 +175,13 @@ Captured with `tools/windows-capture/` on Windows 10 (raw output not published).
     released at that point, so `serato-launch.sh` watches the log created by its own launch and runs
     `wineserver -k` if Serato is still alive 20 s (`SERATO_QUIT_GRACE`) after
     "Application phase set to Shutdown" (only logged on quit). Root cause still unknown.
+27. **Serato hangs after a startup crash (worked around).** Seen right after a session whose ASIO
+    stream died ("long dropout detected, restarting" in a loop): the next launch crashed ~25 s in, at
+    "Normal operation", and hung the same way (crashpad_popup.exe up, no dump). A clean relaunch after
+    `wineserver -k` worked. `serato-launch.sh` now treats `Dumps/last_crash` rewritten during its own
+    launch as a crash: it runs `wineserver -k` immediately and, if the crash happened within
+    `SERATO_START_WINDOW` (90 s), launches Serato once more. Before launching it also stops a leftover
+    prefix when no Serato process is running. Root cause still unknown.
 
 ## Next step
 
